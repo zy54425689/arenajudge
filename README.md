@@ -37,7 +37,7 @@ agree on, while the prize custody and the payout stay deterministic and real.
 `contracts/arena_judge.py` — deployed on **Bradbury**.
 
 ```
-0x704Eb6BE44f771178b7A580d861FC4A52720E901
+0xdE25985f5a670d8b61190D9A0aaD9ac994AbBa70
 ```
 
 ### Money flow
