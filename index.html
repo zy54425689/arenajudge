@@ -145,6 +145,7 @@
     <div class="st"><div class="k">MATCHES</div><div class="n" id="sCount">—</div></div>
     <div class="st"><div class="k">PRIZES LOCKED</div><div class="n" id="sLocked">—<small>GEN</small></div></div>
     <div class="st"><div class="k">JUDGED</div><div class="n" id="sJudged">—</div></div>
+    <div class="st"><div class="k">STATUS</div><div class="n" style="font-size:13px" id="aggNote">—</div></div>
     <div class="st"><div class="k">MY CREDIT</div><div class="n" id="sCredit">—<small>GEN</small></div></div>
   </div>
 
@@ -249,19 +250,27 @@
 import { createClient } from "https://esm.sh/genlayer-js@0.7.0";
 import { testnetBradbury } from "https://esm.sh/genlayer-js@0.7.0/chains";
 
-const ADDR = "0x37CAC21d02B4805aB25f56355BABe7058Ae6F04B";
+const ADDR = "0x704Eb6BE44f771178b7A580d861FC4A52720E901";
 const REPO = "https://github.com/zy54425689/arenajudge";
 const EXPLORER = "https://explorer-bradbury.genlayer.com/address/" + ADDR;
 // ------------------------------------------------------------------------
 
-const MSTATE = ["OPEN", "JUDGED", "INCONCLUSIVE", "PAID", "REFUNDED"];
+const MSTATE = ["OPEN", "READY", "JUDGED", "INCONCLUSIVE", "PAID", "REFUNDED"];
 const WINNER = ["undecided", "A", "B", "draw"];
 const PAGE_SIZE = 10;
 const $ = (id) => document.getElementById(id);
 const readClient = createClient({ chain: testnetBradbury });
 let writeClient = null, myAddr = null, selected = null, matches = [], pageOffset = 0, pageTotal = 0;
 
-const eth = (w) => (Number(w) / 1e18).toFixed(6);
+// precision-safe: BigInt arithmetic only, never Number(w)/1e18
+const eth = (w) => {
+  const v = BigInt(typeof w === "bigint" ? w : String(w));
+  const neg = v < 0n;
+  const a = neg ? -v : v;
+  const whole = a / 10n ** 18n;
+  let frac = (a % 10n ** 18n).toString().padStart(18, "0").slice(0, 6).replace(/0+$/, "");
+  return (neg ? "-" : "") + whole.toString() + (frac ? "." + frac : "");
+};
 const short = (a) => (a && a.length > 16) ? a.slice(0, 8) + "…" + a.slice(-6) : a;
 const gen = (gw) => BigInt(Math.round(parseFloat(gw) * 1e6)) * 1000000000000n;
 function msg(el, t, k = "info") { el.className = "msg show " + k; el.textContent = t; }
@@ -294,6 +303,7 @@ function renderDetail(m) {
   const st = Number(m.state);
   $("dState").className = "badge b" + st;
   $("dState").textContent = MSTATE[st] ?? st;
+  const dr = $("dRefund"); if (dr) dr.textContent = m.refundable ? "yes — host may refund" : (m.submitted_a || m.submitted_b ? "no — evidence is committed" : "no — window still open");
   $("dNums").innerHTML =
     `<div>HOST<b>${short(m.host)}</b></div>` +
     `<div>PRIZE<b class="t">${eth(m.prize)} GEN</b></div>` +
@@ -336,10 +346,27 @@ async function loadAll() {
       } catch {}
     }
     renderList();
-    const locked = matches.filter((m) => !m.settled).reduce((s, m) => s + Number(m.prize), 0);
+    // aggregate over ALL matches, not over the visible page
+    let locked = 0n, judged = 0, inconclusive = 0, ready = 0;
+    const AGG = 50;
+    for (let off = 0; off < pageTotal; off += AGG) {
+      let page;
+      try {
+        page = await readClient.readContract({ address: ADDR, functionName: "get_page", args: [BigInt(off), BigInt(AGG)] });
+      } catch { break; }
+      for (const r of (page.rows || [])) {
+        const st = Number(r.state);
+        if (st !== 4 && st !== 5) locked += BigInt(r.prize);      // not PAID / not REFUNDED
+        if (st === 2) judged++;
+        if (st === 1) ready++;
+        if (st === 3) inconclusive++;
+      }
+    }
     $("sCount").textContent = pageTotal;
     $("sLocked").innerHTML = `${eth(locked)}<small>GEN</small>`;
-    $("sJudged").textContent = matches.filter((m) => Number(m.state) === 1 || Number(m.state) === 3).length;
+    $("sJudged").textContent = judged;
+    const aggNote = $("aggNote");
+    if (aggNote) aggNote.textContent = `${ready} awaiting judging · ${inconclusive} unresolved`;
     $("listNote").textContent = `· ${pageOffset + 1}-${Math.min(pageOffset + PAGE_SIZE, pageTotal)} of ${pageTotal}`;
     $("pgInfo").textContent = `${pageOffset + 1}-${Math.min(pageOffset + PAGE_SIZE, pageTotal)} / ${pageTotal}`;
     $("pgPrev").disabled = pageOffset <= 0;

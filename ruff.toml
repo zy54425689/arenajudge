@@ -1,0 +1,28 @@
+# Ruff configuration for the ArenaJudge contract + Direct Mode tests.
+#
+# The contract runs inside GenVM, where failures are raised as `gl.vm.UserError`. Test code cannot
+# import that exception reliably outside the VM, so asserting `pytest.raises(Exception)` is the only
+# practical way to check that a guard fires — hence B017 is switched off for the test directory.
+
+target-version = "py312"
+line-length = 110
+
+[lint]
+select = ["E", "F", "W", "B", "I"]
+ignore = [
+    "E501",   # long lines are fine in prose-heavy assertions and prompt strings
+]
+
+[lint.per-file-ignores]
+"tests/**" = [
+    "B017",   # pytest.raises(Exception) — the only way to assert a GenVM UserError
+]
+"contracts/**" = [
+    "F403",   # `from genlayer import *` is how the GenVM runtime is injected
+    "F405",   # names come from that star import
+    "E402",   # the module-level `# { "Depends": ... }` header must stay first
+]
+
+[format]
+quote-style = "double"
+indent-style = "space"

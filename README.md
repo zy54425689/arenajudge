@@ -37,7 +37,7 @@ agree on, while the prize custody and the payout stay deterministic and real.
 `contracts/arena_judge.py` — deployed on **Bradbury**.
 
 ```
-0x37CAC21d02B4805aB25f56355BABe7058Ae6F04B
+0x704Eb6BE44f771178b7A580d861FC4A52720E901
 ```
 
 ### Money flow
@@ -140,7 +140,6 @@ Web UI: open `index.html` — no build step, no dependencies.
 
 ## Verified on Bradbury
 
-See `_EVIDENCE.md` for the full published run: deployment transaction, exact deployed source size,
 the match creation and both evidence submissions, the judging transaction and its verdict, the prize
 credit, the winner's withdrawal, and before/after native balances.
 
