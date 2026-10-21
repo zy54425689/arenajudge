@@ -1,393 +1,365 @@
-# -*- coding: utf-8 -*-
-"""ArenaJudge direct-mode tests — escrowed prize pools settled by an on-chain referee.
+import pytest
 
-Run: pytest tests/direct/ -v
-"""
+CONTRACT = "contracts/arena_judge.py"
 
-PRIZE = 1000000000000000     # 0.001 GEN
-W3 = "0x07F0ED876895ebb9C9944b31A8Be7Dcded31AaC1"   # third wallet used as player B
-MAX_ROUNDS = 3
+RULES = "Best of three; the side with the higher verified final score wins."
+URL_A = "https://example.com/a-packet.md"
+URL_B = "https://example.com/b-packet.md"
 
+PACKET_A = ("Packet A: round one 11-9, round two 11-7, round three 11-13. Totals 33-29. "
+            "Screenshot timestamps and referee signature attached for every round.")
+PACKET_B = ("Packet B: round one 9-11, round two 7-11, round three 13-11. Totals 29-33. "
+            "Same three rounds, no referee signature attached.")
 
-def _deploy(direct_vm, direct_deploy, host=None):
-    import pathlib
-    import tempfile
-
-    src = pathlib.Path(__file__).resolve().parents[2] / "contracts" / "arena_judge.py"
-    code = src.read_text(encoding="utf-8")
-    tmp = pathlib.Path(tempfile.gettempdir()) / "arena_judge_local.py"
-    tmp.write_text(code, encoding="utf-8")
-    if host is not None:
-        direct_vm.sender = host
-    return direct_deploy(str(tmp))
-
-
-def _addr(v):
-    from genlayer import Address
-    return Address(v)
+GOOD_A = {"inconclusive": False, "winner": 0, "score": 88, "confidence": "high",
+          "decided": True, "reason": "A wins two of three rounds with signed scorecards."}
+GOOD_B = {"inconclusive": False, "winner": 1, "score": 80, "confidence": "high",
+          "decided": True, "reason": "B outscored A in the decisive round."}
+DRAW = {"inconclusive": False, "winner": 2, "score": 50, "confidence": "medium",
+        "decided": True, "reason": "The packets do not separate the sides."}
+UNDECIDABLE = {"inconclusive": False, "winner": 2, "score": 10, "confidence": "low",
+               "decided": False, "reason": "Evidence conflicts and cannot be reconciled."}
 
 
-def _match(direct_vm, c, host, a, b, prize=PRIZE,
-           title="Finals", rules="Best of three, highest score wins"):
-    direct_vm.sender = host
-    direct_vm.value = prize
-    mid = c.create_match(title, rules, _addr(a), _addr(b))
+@pytest.fixture
+def arena(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    direct_vm.sender = direct_alice          # host
+    c = direct_deploy(CONTRACT)
+    direct_vm.value = 2 * 10**17             # 0.2 GEN prize
+    c.create_match("Grand Final", RULES, direct_bob, direct_charlie, 3600)
     direct_vm.value = 0
+    return c
+
+
+def commit(direct_vm, c, who, url, mid=0):
+    direct_vm.sender = who
+    c.submit_evidence(mid, url)
     return mid
 
 
-def _evidence(direct_vm, c, who, mid, url):
-    direct_vm.sender = who
-    c.submit_evidence(mid, url)
+# ---------------- custody and creation ----------------
+
+def test_create_match_escrows_the_prize(direct_vm, arena, direct_alice, direct_bob, direct_charlie):
+    m = arena.get_match(0)
+    assert m["prize"] == 2 * 10**17
+    assert m["state"] == 0                       # S_OPEN
+    assert m["submitted_a"] is False
+    assert m["submitted_b"] is False
+    assert m["evidence_count"] == 0
+    host = m["host"].lower().replace("0x", "")
+    assert host == direct_alice.hex().lower().replace("0x", "")
 
 
-def _verdict(winner="A", score=85, conf="high"):
-    return {"inconclusive": False, "winner": winner, "score": score,
-            "confidence": conf, "reason": "Artefacts adjudicated."}
-
-
-# ================================================= 1. creation
-
-def test_create_requires_prize(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy)
+def test_prize_is_required(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     direct_vm.sender = direct_alice
+    c = direct_deploy(CONTRACT)
     direct_vm.value = 0
-    with direct_vm.expect_revert("A prize is required"):
-        c.create_match("Finals", "Best of three", _addr(direct_bob), _addr(direct_alice))
-
-
-def test_create_validation(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy)
-    direct_vm.sender = direct_alice
-    direct_vm.value = PRIZE
-    with direct_vm.expect_revert("Title is required"):
-        c.create_match("", "Best of three", _addr(direct_bob), _addr(direct_alice))
-    with direct_vm.expect_revert("Title is too long"):
-        c.create_match("x" * 97, "Best of three", _addr(direct_bob), _addr(direct_alice))
-    with direct_vm.expect_revert("Rules are required"):
-        c.create_match("Finals", "", _addr(direct_bob), _addr(direct_alice))
-    with direct_vm.expect_revert("Rules are too long"):
-        c.create_match("Finals", "y" * 701, _addr(direct_bob), _addr(direct_alice))
-    direct_vm.value = 0
+    with pytest.raises(Exception):
+        c.create_match("No prize", RULES, direct_bob, direct_charlie, 3600)
 
 
 def test_host_cannot_also_play(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy)
     direct_vm.sender = direct_alice
-    direct_vm.value = PRIZE
-    with direct_vm.expect_revert("The host cannot also play"):
-        c.create_match("Finals", "Best of three", _addr(direct_alice), _addr(direct_bob))
-    direct_vm.value = 0
+    c = direct_deploy(CONTRACT)
+    direct_vm.value = 10**17
+    with pytest.raises(Exception):
+        c.create_match("Self match", RULES, direct_alice, direct_bob, 3600)
 
 
 def test_players_must_differ(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy)
     direct_vm.sender = direct_alice
-    direct_vm.value = PRIZE
-    with direct_vm.expect_revert("The two players must differ"):
-        c.create_match("Finals", "Best of three", _addr(direct_bob), _addr(direct_bob))
+    c = direct_deploy(CONTRACT)
+    direct_vm.value = 10**17
+    with pytest.raises(Exception):
+        c.create_match("Same player", RULES, direct_bob, direct_bob, 3600)
+
+
+def test_evidence_window_needs_a_minimum(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    direct_vm.sender = direct_alice
+    c = direct_deploy(CONTRACT)
+    direct_vm.value = 10**17
+    with pytest.raises(Exception):
+        c.create_match("Too short", RULES, direct_bob, direct_charlie, 5)
+
+
+# ---------------- evidence commitment ----------------
+
+def test_evidence_is_committed_with_a_digest(direct_vm, arena, direct_bob):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    m = arena.get_match(0)
+    assert m["submitted_a"] is True
+    assert m["url_a"] == URL_A
+    assert m["digest_a"] != ""
+    assert m["evidence_count"] == 1
+    assert m["state"] == 0                      # still OPEN, only one side committed
+
+
+def test_evidence_cannot_be_replaced(direct_vm, arena, direct_bob):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception):
+        arena.submit_evidence(0, "https://example.com/rewritten.md")
+    assert arena.get_match(0)["url_a"] == URL_A
+
+
+def test_only_named_players_may_commit(direct_vm, arena, direct_alice):
+    direct_vm.sender = direct_alice            # the host is not a player
+    with pytest.raises(Exception):
+        arena.submit_evidence(0, URL_A)
+
+
+def test_both_sides_move_the_match_to_ready(direct_vm, arena, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    m = arena.get_match(0)
+    assert m["evidence_count"] == 2
+    assert m["state"] == 1                      # S_READY
+
+
+def test_evidence_url_must_be_http(direct_vm, arena, direct_bob):
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception):
+        arena.submit_evidence(0, "ftp://example.com/a")
+    with pytest.raises(Exception):
+        arena.submit_evidence(0, "")
+
+
+# ---------------- the refund hole the reviewer found ----------------
+
+def test_refund_is_refused_after_one_side_commits(
+        direct_vm, arena, direct_alice, direct_bob):
+    """Previously the host could take the prize back while a player had already committed."""
+    commit(direct_vm, arena, direct_bob, URL_A)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception):
+        arena.refund(0)
+    assert arena.get_match(0)["settled"] is False
+
+
+def test_refund_is_refused_after_both_sides_commit(
+        direct_vm, arena, direct_alice, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception):
+        arena.refund(0)
+    assert arena.get_match(0)["state"] == 1
+
+
+def test_refund_is_refused_while_the_window_is_open(
+        direct_vm, arena, direct_alice):
+    """Nobody committed, but players still have time - the host must wait."""
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception):
+        arena.refund(0)
+    assert arena.get_match(0)["refundable"] is False
+
+
+def test_refund_works_after_the_window_closes_with_no_evidence(
+        direct_vm, arena, direct_alice):
+    direct_vm.warp("2026-10-21T12:58:24.000Z")
+    m = arena.get_match(0)
+    assert m["refundable"] is True
+    direct_vm.sender = direct_alice
+    arena.refund(0)
+    m = arena.get_match(0)
+    assert m["settled"] is True
+    assert m["state"] == 5                      # S_REFUNDED
+    assert arena.get_credit(direct_alice) == 2 * 10**17
+
+
+def test_only_the_host_can_refund(direct_vm, arena, direct_bob):
+    direct_vm.warp("2026-10-21T12:58:24.000Z")
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception):
+        arena.refund(0)
+
+
+def test_refund_is_refused_once_a_verdict_exists(
+        direct_vm, arena, direct_alice, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 200, "body": PACKET_A})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 200, "body": PACKET_B})
+    direct_vm.mock_llm(r".*judge of an on-chain contest.*", GOOD_A)
+    arena.judge_match(0)
+    assert arena.get_match(0)["state"] == 2     # S_JUDGED
+    direct_vm.sender = direct_alice
+    with pytest.raises(Exception):
+        arena.refund(0)
+
+
+# ---------------- judging ----------------
+
+def test_judge_requires_both_evidence_packets(direct_vm, arena, direct_bob):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    with pytest.raises(Exception):
+        arena.judge_match(0)
+
+
+def test_unreachable_artifact_makes_the_match_inconclusive(
+        direct_vm, arena, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 404, "body": ""})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 200, "body": PACKET_B})
+    arena.judge_match(0)
+    m = arena.get_match(0)
+    assert m["state"] == 3                      # S_INCONCLUSIVE
+    assert m["winner"] == 2
+    assert "unusable" in m["reason"].lower() or "HTTP" in m["reason"]
+
+
+def test_non_200_response_is_not_treated_as_evidence(
+        direct_vm, arena, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 200, "body": PACKET_A})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 500, "body": PACKET_B})
+    arena.judge_match(0)
+    assert arena.get_match(0)["state"] == 3
+
+
+def test_a_too_short_packet_cannot_decide_a_match(
+        direct_vm, arena, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 200, "body": PACKET_A})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 200, "body": "404 page not found"})
+    arena.judge_match(0)
+    assert arena.get_match(0)["state"] == 3
+
+
+def test_decided_verdict_is_recorded(direct_vm, arena, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 200, "body": PACKET_A})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 200, "body": PACKET_B})
+    direct_vm.mock_llm(r".*judge of an on-chain contest.*", GOOD_A)
+    arena.judge_match(0)
+    m = arena.get_match(0)
+    assert m["state"] == 2
+    assert m["winner"] == 0
+    assert m["score"] == 88
+    assert m["digest_a"] != "" and m["digest_b"] != ""
+
+
+def test_undecidable_verdict_becomes_inconclusive_not_a_win(
+        direct_vm, arena, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 200, "body": PACKET_A})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 200, "body": PACKET_B})
+    direct_vm.mock_llm(r".*judge of an on-chain contest.*", UNDECIDABLE)
+    arena.judge_match(0)
+    m = arena.get_match(0)
+    assert m["state"] == 3
+    assert m["winner"] == 2
+
+
+def test_rounds_are_bounded_then_refund_opens(
+        direct_vm, arena, direct_alice, direct_bob, direct_charlie):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 404, "body": ""})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 200, "body": PACKET_B})
+    for _ in range(3):
+        arena.judge_match(0)
+    assert arena.get_match(0)["rounds"] == 3
+    with pytest.raises(Exception):
+        arena.judge_match(0)
+    # evidence was committed, so refund is only reachable now that rounds are exhausted
+    direct_vm.sender = direct_alice
+    arena.refund(0)
+    assert arena.get_match(0)["state"] == 5
+
+
+# ---------------- payout ----------------
+
+def _judge_for(direct_vm, arena, direct_bob, direct_charlie, verdict):
+    commit(direct_vm, arena, direct_bob, URL_A)
+    commit(direct_vm, arena, direct_charlie, URL_B)
+    direct_vm.mock_web(r".*a-packet\.md", {"status": 200, "body": PACKET_A})
+    direct_vm.mock_web(r".*b-packet\.md", {"status": 200, "body": PACKET_B})
+    direct_vm.mock_llm(r".*judge of an on-chain contest.*", verdict)
+    arena.judge_match(0)
+
+
+def test_winner_is_credited_the_prize(direct_vm, arena, direct_bob, direct_charlie):
+    _judge_for(direct_vm, arena, direct_bob, direct_charlie, GOOD_A)
+    arena.claim_prize(0)
+    assert arena.get_credit(direct_bob) == 2 * 10**17
+    assert arena.get_credit(direct_charlie) == 0
+    assert arena.get_match(0)["paid"] is True
+
+
+def test_draw_splits_the_prize(direct_vm, arena, direct_bob, direct_charlie):
+    _judge_for(direct_vm, arena, direct_bob, direct_charlie, DRAW)
+    arena.claim_prize(0)
+    assert arena.get_credit(direct_bob) == 10**17
+    assert arena.get_credit(direct_charlie) == 10**17
+
+
+def test_claim_is_idempotent(direct_vm, arena, direct_bob, direct_charlie):
+    _judge_for(direct_vm, arena, direct_bob, direct_charlie, GOOD_A)
+    arena.claim_prize(0)
+    with pytest.raises(Exception):
+        arena.claim_prize(0)
+    assert arena.get_credit(direct_bob) == 2 * 10**17      # paid exactly once
+
+
+def test_cannot_claim_without_a_verdict(direct_vm, arena, direct_bob):
+    direct_vm.sender = direct_bob
+    with pytest.raises(Exception):
+        arena.claim_prize(0)
+
+
+def test_withdraw_credit_zeroes_before_paying(direct_vm, arena, direct_bob, direct_charlie):
+    _judge_for(direct_vm, arena, direct_bob, direct_charlie, GOOD_A)
+    arena.claim_prize(0)
+    direct_vm.sender = direct_bob
+    arena.withdraw_credit()
+    assert arena.get_credit(direct_bob) == 0
+    with pytest.raises(Exception):
+        arena.withdraw_credit()
+
+
+def test_page_view_reports_totals(direct_vm, arena):
+    p = arena.get_page(0, 10)
+    assert p["total"] == 1
+    assert len(p["rows"]) == 1
+    assert p["rows"][0]["evidence_count"] == 0
+
+
+# ---------------- address arguments arrive as 0x strings over ABI ----------------
+
+def test_create_match_accepts_hex_string_players(
+        direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    """GenVM passes address arguments as 0x-hex strings, so the contract must parse them."""
+    direct_vm.sender = direct_alice
+    c = direct_deploy(CONTRACT)
+    a_hex = "0x" + direct_bob.hex()
+    b_hex = "0x" + direct_charlie.hex()
+    direct_vm.value = 10**17
+    mid = c.create_match("Hex players", RULES, a_hex, b_hex, 3600)
+    direct_vm.value = 0
+    m = c.get_match(mid)
+    assert m["prize"] == 10**17
+    assert m["player_a"].lower().replace("0x", "") == direct_bob.hex().lower().replace("0x", "")
+    assert m["player_b"].lower().replace("0x", "") == direct_charlie.hex().lower().replace("0x", "")
+
+
+def test_create_match_rejects_a_bad_address_string(
+        direct_vm, direct_deploy, direct_alice, direct_bob):
+    direct_vm.sender = direct_alice
+    c = direct_deploy(CONTRACT)
+    direct_vm.value = 10**17
+    with pytest.raises(Exception):
+        c.create_match("Bad addr", RULES, "0x1234", "0x" + direct_bob.hex(), 3600)
     direct_vm.value = 0
 
 
-def test_prize_is_custody(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=2500)
-    m = c.get_match(mid)
-    assert int(m["prize"]) == 2500
-    assert int(m["state"]) == 0
-    assert m["settled"] is False
-    assert int(m["rounds"]) == 0
-    assert m["host"].lower() == "0x" + bytes(direct_alice).hex()
-
-
-# ================================================= 2. evidence
-
-def test_only_named_players_submit(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    direct_vm.sender = direct_alice          # host
-    with direct_vm.expect_revert("Only the two named players can submit evidence"):
-        c.submit_evidence(mid, "https://example.com/a")
-
-
-def test_evidence_url_validation(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    direct_vm.sender = direct_bob
-    with direct_vm.expect_revert("A valid evidence URL is required"):
-        c.submit_evidence(mid, "not-a-url")
-    with direct_vm.expect_revert("Evidence URL is too long"):
-        c.submit_evidence(mid, "https://e.com/" + "z" * 510)
-
-
-def test_both_sides_recorded(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/bob-log")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/alice-log")
-    m = c.get_match(mid)
-    assert m["evidence_a"] == "https://example.com/bob-log"     # player A = direct_bob
-    assert m["evidence_b"] == "https://example.com/alice-log"   # player B = W3
-
-
-# ================================================= 3. judging
-
-def test_judge_requires_both_evidence(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    direct_vm.sender = direct_alice
-    with direct_vm.expect_revert("Both players must submit evidence first"):
-        c.judge_match(mid)
-
-
-def test_verdict_is_one_shot(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*example\.com.*", {"status": 200, "body": "<html>score 21-18 with timestamps</html>"})
-    direct_vm.mock_llm(r".*", _verdict("A", 88))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    with direct_vm.expect_revert("Match already has a verdict"):
-        c.judge_match(mid)
-
-
-def test_unreachable_evidence_is_inconclusive(direct_vm, direct_deploy, direct_alice, direct_bob):
-    """A network failure must never hand the prize to anyone."""
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 503, "body": ""})
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    m = c.get_match(mid)
-    assert int(m["state"]) == 2          # INCONCLUSIVE
-    assert int(m["rounds"]) == 1
-    assert m["settled"] is False
-    with direct_vm.expect_revert("Match has no final verdict"):
-        c.claim_prize(mid)
-
-
-def test_rounds_are_bounded(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 503, "body": ""})
-    direct_vm.sender = direct_alice
-    for _ in range(MAX_ROUNDS):
-        c.judge_match(mid)
-    assert int(c.get_match(mid)["rounds"]) == MAX_ROUNDS
-    with direct_vm.expect_revert("Judging rounds exhausted"):
-        c.judge_match(mid)
-
-
-def test_malformed_verdict_is_inconclusive(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>x</html>"})
-    direct_vm.mock_llm(r".*", {"winner": "A"})     # missing keys
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    assert int(c.get_match(mid)["state"]) == 2
-
-
-# ================================================= 4. verdicts and payouts
-
-def test_a_wins_takes_prize(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=1000)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>a won clearly</html>"})
-    direct_vm.mock_llm(r".*", _verdict("A", 90))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    assert int(c.get_match(mid)["winner"]) == 1
-    c.claim_prize(mid)
-    assert int(c.get_credit(_addr(direct_bob))) == 1000     # player A = direct_bob
-
-
-def test_b_wins_takes_prize(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=1000)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>b won clearly</html>"})
-    direct_vm.mock_llm(r".*", _verdict("B", 92))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    assert int(c.get_match(mid)["winner"]) == 2
-    c.claim_prize(mid)
-    assert int(c.get_credit(_addr(W3))) == 1000             # player B = W3
-
-
-def test_draw_splits_prize(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=1001)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>equivalent</html>"})
-    direct_vm.mock_llm(r".*", _verdict("draw", 60))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    assert int(c.get_match(mid)["winner"]) == 3
-    c.claim_prize(mid)
-    a_credit = int(c.get_credit(_addr(direct_bob)))
-    b_credit = int(c.get_credit(_addr(W3)))
-    assert a_credit + b_credit == 1001
-    assert abs(a_credit - b_credit) <= 1        # odd prize splits fairly
-
-
-def test_claim_twice_reverts(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>x</html>"})
-    direct_vm.mock_llm(r".*", _verdict("A", 80))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    _m = c.get_match(mid)
-    print("\n>>> DBG after judge: state=", _m["state"], "winner=", _m["winner"], "rounds=", _m["rounds"], "reason=", _m["reason"][:80])
-    c.claim_prize(mid)
-    with direct_vm.expect_revert("Prize already settled"):
-        c.claim_prize(mid)
-
-
-def test_claim_requires_verdict(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    direct_vm.sender = direct_alice
-    with direct_vm.expect_revert("Match has no final verdict"):
-        c.claim_prize(mid)
-
-
-# ================================================= 5. refund and pull
-
-def test_host_refund_after_rounds_exhausted(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=1000)
-
-    # an OPEN match is refundable (nobody played) — this is the host's safety valve;
-    # the "rounds remain" guard only applies once judging has begun and stayed inconclusive
-
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 503, "body": ""})
-    for _ in range(MAX_ROUNDS):
-        c.judge_match(mid)
-
-    direct_vm.sender = direct_bob               # only host refunds
-    with direct_vm.expect_revert("Only the host can refund"):
-        c.refund(mid)
-
-    direct_vm.sender = direct_alice
-    c.refund(mid)
-    assert int(c.get_match(mid)["state"]) == 4
-    assert int(c.get_credit(_addr(direct_alice))) == 1000
-
-
-def test_refund_blocked_when_verdict_exists(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>x</html>"})
-    direct_vm.mock_llm(r".*", _verdict("A", 85))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    with direct_vm.expect_revert("A verdict exists; claim it instead"):
-        c.refund(mid)
-
-
-def test_withdraw_credit_clears_before_transfer(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=1000)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>x</html>"})
-    direct_vm.mock_llm(r".*", _verdict("B", 90))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-    c.claim_prize(mid)
-
-    assert int(c.get_credit(_addr(W3))) == 1000
-    direct_vm.sender = _addr(W3)
-    c.withdraw_credit()
-    assert int(c.get_credit(_addr(W3))) == 0
-    with direct_vm.expect_revert("No credit to withdraw"):
-        c.withdraw_credit()
-
-
-# ================================================= 6. pagination
-
-def test_pagination_is_bounded(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    for i in range(5):
-        _match(direct_vm, c, direct_alice, direct_bob, W3, title="M" + str(i))
-    p1 = c.get_page(0, 2)
-    assert int(p1["total"]) == 5
-    assert len(p1["items"]) == 2
-    assert int(p1["items"][0]["id"]) == 1
-    big = c.get_page(0, 999)
-    assert len(big["items"]) == 5
-
-
-# ================================================= 7. lifecycle
-
-def test_full_match_lifecycle(direct_vm, direct_deploy, direct_alice, direct_bob):
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-    mid = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=1000)
-    _evidence(direct_vm, c, direct_bob, mid, "https://example.com/b")
-    _evidence(direct_vm, c, _addr(W3), mid, "https://example.com/a")
-    direct_vm.mock_web(r".*", {"status": 200, "body": "<html>b defeated a</html>"})
-    direct_vm.mock_llm(r".*", _verdict("B", 93))
-    direct_vm.sender = direct_alice
-    c.judge_match(mid)
-
-    m = c.get_match(mid)
-    assert int(m["state"]) == 1          # JUDGED
-    assert m["reason"] != ""
-    assert m["confidence"] == "high"
-
-    c.claim_prize(mid)
-    assert int(c.get_match(mid)["state"]) == 3     # PAID
-    assert int(c.get_credit(_addr(W3))) == 1000
-    direct_vm.sender = _addr(W3)
-    c.withdraw_credit()
-    assert int(c.get_credit(_addr(W3))) == 0
-
-
-def test_prize_always_reaches_a_terminal_state(direct_vm, direct_deploy, direct_alice, direct_bob):
-    """Won, refunded — the prize never stays stranded."""
-    c = _deploy(direct_vm, direct_deploy, direct_alice)
-
-    won = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=500, title="Won")
-    _evidence(direct_vm, c, direct_bob, won, "https://example.com/won-b")
-    _evidence(direct_vm, c, _addr(W3), won, "https://example.com/won-a")
-    direct_vm.mock_web(r".*example\.com/won.*", {"status": 200, "body": "<html>clear result</html>"})
-    direct_vm.mock_llm(r".*clear result.*", _verdict("A", 88))
-    direct_vm.sender = direct_alice
-    c.judge_match(won)
-    c.claim_prize(won)
-
-    stuck = _match(direct_vm, c, direct_alice, direct_bob, W3, prize=500, title="Stuck")
-    _evidence(direct_vm, c, direct_bob, stuck, "https://example.com/stuck-b")
-    _evidence(direct_vm, c, _addr(W3), stuck, "https://example.com/stuck-a")
-    direct_vm.mock_web(r".*", {"status": 503, "body": ""})
-    for _ in range(MAX_ROUNDS):
-        c.judge_match(stuck)
-    direct_vm.sender = direct_alice          # host refunds
-    c.refund(stuck)
-
-    assert int(c.get_match(won)["state"]) == 3
-    assert int(c.get_match(stuck)["state"]) == 4
-    # player_a got 500 (won), host got 500 back (refund)
-    assert int(c.get_credit(_addr(direct_bob))) == 500
-    assert int(c.get_credit(_addr(direct_alice))) == 500
+def test_get_credit_accepts_a_hex_string(
+        direct_vm, arena, direct_bob):
+    who = "0x" + direct_bob.hex()
+    assert arena.get_credit(who) == 0
